@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import base64
 import json
 import mimetypes
+import sys
 from pathlib import Path
 
 import joblib
@@ -8,8 +11,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from science_explainer import (
+    answer_science_question,
+    build_ai_stack_cards,
+    build_research_insight_cards,
+    format_prediction_context,
+)
+
 CONF_THRESHOLDS = {"high": 0.75, "medium": 0.55}
 MODEL = Path("artifacts/model.joblib")
+DEEP_MODEL = Path("artifacts/deep_model.joblib")
 FEATS = ["orbital_period", "transit_duration", "transit_depth", "planet_radius"]
 
 SLIDER_LIMITS = {
@@ -75,6 +87,22 @@ def load_model():
         st.stop()
     return joblib.load(MODEL)
 
+@st.cache_resource
+def load_deep_model():
+    if not DEEP_MODEL.exists():
+        return None
+    return joblib.load(DEEP_MODEL)
+
+def predict_with_model(active_model, X: pd.DataFrame) -> tuple[list[str], np.ndarray, str, float]:
+    if hasattr(active_model, "predict_proba"):
+        proba = active_model.predict_proba(X)[0]
+        classes = list(active_model.classes_)
+    else:
+        classes = list(active_model.classes_) if hasattr(active_model, "classes_") else ["CANDIDATE", "CONFIRMED", "FALSE POSITIVE"]
+        proba = np.full(len(classes), 1 / len(classes))
+    pred_idx = int(np.argmax(proba))
+    return classes, proba, classes[pred_idx], float(proba[pred_idx])
+
 def prob_bars(classes, proba):
     order = np.argsort(proba)
     for i in order:
@@ -107,7 +135,7 @@ def show_media_for(pred_cls: str):
         return
     try:
         data = media.read_bytes()
-        st.image(data, use_container_width=True)
+        st.image(data, width="stretch")
     except Exception as e:
         st.error(f"Could not load media: {media.name}")
         st.exception(e)
@@ -165,17 +193,99 @@ input, textarea {
   border: 1px solid #aacdfd !important;
   border-radius: 6px !important;
 }
+.swai-floating-assistant {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 9999;
+  width: 4.25rem;
+  height: 4.25rem;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #007BFF;
+  color: white !important;
+  font-size: 1.65rem;
+  text-decoration: none !important;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.36);
+  border: 1px solid rgba(255,255,255,.35);
+}
+.swai-floating-assistant:hover {
+  background: #339CFF;
+  color: white !important;
+}
+.swai-ai-card {
+  min-height: 15.5rem;
+  border: 1px solid rgba(160, 198, 255, .34);
+  border-radius: 8px;
+  padding: 1rem;
+  background: rgba(0, 17, 45, .58);
+}
+.swai-ai-card h4 {
+  margin-top: 0;
+  margin-bottom: .45rem;
+}
+.swai-ai-card p {
+  margin: .45rem 0;
+}
+.swai-card-label {
+  color: #9cc8ff;
+  font-weight: 700;
+}
+.swai-chat-panel {
+  border: 1px solid rgba(160, 198, 255, .34);
+  border-radius: 8px;
+  padding: 1rem;
+  background: rgba(0, 17, 45, .62);
+}
+.swai-assistant-note {
+  font-size: .9rem;
+  color: rgba(255,255,255,.82);
+}
+.swai-research-card {
+  min-height: 18rem;
+  border: 1px solid rgba(160, 198, 255, .34);
+  border-radius: 8px;
+  padding: 1rem;
+  background: rgba(0, 17, 45, .58);
+}
+.swai-research-card h4 {
+  margin-top: 0;
+  margin-bottom: .35rem;
+}
+.swai-research-card h5 {
+  margin-top: 0;
+  margin-bottom: .75rem;
+  color: #9cc8ff;
+}
+.swai-source-link {
+  color: #9cc8ff !important;
+  font-weight: 700;
+}
 </style>
 """
 
 st.set_page_config(page_title="SWAI - Exoplanet Classifier", page_icon="🪐", layout="wide")
 set_page_background("artifacts/backgrounds/bg.jpg")
 st.markdown(RESPONSIVE_CSS, unsafe_allow_html=True)
+st.markdown('<a class="swai-floating-assistant" href="#swai-science-explainer" title="Ask SWAI Science Explainer">?</a>', unsafe_allow_html=True)
 
 st.title("Silent Watcher AI 🪐 Exoplanet Classifier")
 st.caption("Categories: CONFIRMED / CANDIDATE / FALSE POSITIVE based on NASA's Kepler/TESS datasets")
 
 model = load_model()
+deep_model = load_deep_model()
+
+if "last_prediction" not in st.session_state:
+    st.session_state.last_prediction = None
+if "assistant_history" not in st.session_state:
+    st.session_state.assistant_history = [
+        (
+            "assistant",
+            "Hi, I am SWAI's Science Explainer. Ask me about the prediction, transit depth, false positives, or how AI fits into this project.",
+        )
+    ]
 
 st.subheader("Manual entry")
 with st.expander("What does each field mean?"):
@@ -226,28 +336,52 @@ with c2:
         help="Planet size in Earth radii proportion",
     )
 
-if st.button("Predict (manual)", use_container_width=True):
+if st.button("Predict (manual)", width="stretch"):
     X = pd.DataFrame([{
         "orbital_period": period,
         "transit_duration": dur,
         "transit_depth": depth,
         "planet_radius": radius,
     }])
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)[0]
-        classes = list(model.classes_)
-    else:
-        classes = list(model.classes_) if hasattr(model, "classes_") else ["CANDIDATE", "CONFIRMED", "FALSE POSITIVE"]
-        proba = np.full(len(classes), 1 / len(classes))
-    pred_idx = int(np.argmax(proba))
-    pred_cls = classes[pred_idx]
-    pred_conf = float(proba[pred_idx])
+    classes, proba, pred_cls, pred_conf = predict_with_model(model, X)
+    deep_result = None
+    if deep_model is not None:
+        deep_classes, deep_proba, deep_pred_cls, deep_pred_conf = predict_with_model(deep_model, X)
+        deep_result = {
+            "classes": deep_classes,
+            "proba": deep_proba,
+            "class": deep_pred_cls,
+            "confidence": deep_pred_conf,
+        }
+    st.session_state.last_prediction = {
+        "class": pred_cls,
+        "confidence": pred_conf,
+        "deep_class": deep_result["class"] if deep_result else None,
+        "deep_confidence": deep_result["confidence"] if deep_result else None,
+        "inputs": {
+            "orbital_period": period,
+            "transit_duration": dur,
+            "transit_depth": depth,
+            "planet_radius": radius,
+        },
+    }
     label, icon = confidence_label(pred_conf)
     st.success(f"*Prediction: {pred_cls}*  | Trust: *{pred_conf:.0%}* {icon}  ({label})")
+    if deep_result:
+        dl_label, dl_icon = confidence_label(deep_result["confidence"])
+        st.info(
+            f"Deep Learning MVP (MLP neural network): *{deep_result['class']}* | "
+            f"Trust: *{deep_result['confidence']:.0%}* {dl_icon} ({dl_label})"
+        )
+    else:
+        st.warning("Deep Learning model not found yet. Train it with: python src/train_deep_model.py")
     col_stats, col_media = st.columns(2, gap="large")
     with col_stats:
-        st.markdown("#### Probability distribution")
+        st.markdown("#### Machine Learning probability distribution")
         prob_bars(classes, proba)
+        if deep_result:
+            st.markdown("#### Deep Learning probability distribution")
+            prob_bars(deep_result["classes"], deep_result["proba"])
         st.markdown("#### Input snapshot")
         with st.container():
             st.markdown('<div class="metric-row">', unsafe_allow_html=True)
@@ -270,6 +404,51 @@ if st.button("Predict (manual)", use_container_width=True):
 
 st.divider()
 
+st.subheader("AI Roadmap for the Presentation")
+st.caption("A compact MVP of how SWAI connects machine learning, deep learning, reinforcement learning, and LLMs.")
+
+ai_cards = build_ai_stack_cards()
+card_cols = st.columns(4)
+for col, card in zip(card_cols, ai_cards):
+    with col:
+        st.markdown(
+            f"""
+            <div class="swai-ai-card">
+              <h4>{card["title"]}</h4>
+              <p><span class="swai-card-label">Role:</span> {card["role"]}</p>
+              <p><span class="swai-card-label">MVP:</span> {card["mvp"]}</p>
+              <p><span class="swai-card-label">Next:</span> {card["next_step"]}</p>
+              <p><span class="swai-card-label">Status:</span> {card["maturity"]}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+st.info(
+    "Presentation line: Machine Learning makes the prediction, Deep Learning can improve transit-signal detection, "
+    "Reinforcement Learning can optimize follow-up observations, and LLMs make the science understandable and interactive."
+)
+
+st.markdown("#### Source-backed additions")
+research_cards = build_research_insight_cards()
+research_cols = st.columns(3)
+for col, card in zip(research_cols, research_cards):
+    with col:
+        st.markdown(
+            f"""
+            <div class="swai-research-card">
+              <h4>{card["title"]}</h4>
+              <h5>{card["subtitle"]}</h5>
+              <p>{card["body"]}</p>
+              <p><span class="swai-card-label">Presentation takeaway:</span> {card["presentation_takeaway"]}</p>
+              <p><a class="swai-source-link" href="{card["source_url"]}" target="_blank">{card["source_label"]}</a></p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+st.divider()
+
 st.subheader("Prediction by CSV")
 st.caption("Columns: orbital_period, transit_duration, transit_depth, planet_radius")
 
@@ -288,7 +467,57 @@ if uploaded:
             if hasattr(model, "classes_"):
                 for i, cls in enumerate(model.classes_):
                     out[f"proba_{cls}"] = probas[:, i]
-        st.dataframe(out.head(50), use_container_width=True)
+        st.dataframe(out.head(50), width="stretch")
         out.to_csv("artifacts/predictions.csv", index=False)
         st.success("Saved in artifacts/predictions.csv")
 
+st.divider()
+st.markdown('<span id="swai-science-explainer"></span>', unsafe_allow_html=True)
+st.subheader("Ask SWAI - LLM Science Explainer")
+st.markdown(
+    """
+    <div class="swai-chat-panel">
+      <div class="swai-assistant-note">
+        MVP note: this assistant is a local, grounded science explainer. It does not call an external LLM yet, so it is safe for live demos and can later be upgraded to RAG over NASA sources.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+last_prediction = st.session_state.last_prediction
+if last_prediction:
+    prediction_context = format_prediction_context(
+        last_prediction["class"],
+        last_prediction["confidence"],
+        last_prediction["inputs"],
+    )
+else:
+    prediction_context = format_prediction_context(None, None, None)
+
+with st.expander("Current context used by the assistant", expanded=bool(last_prediction)):
+    st.write(prediction_context)
+
+prompt_cols = st.columns(4)
+quick_prompts = [
+    "Explain the current prediction",
+    "What is transit depth?",
+    "What is ExoMiner++?",
+    "How can RL schedule follow-up observations?",
+]
+for col, prompt in zip(prompt_cols, quick_prompts):
+    with col:
+        if st.button(prompt, width="stretch"):
+            answer = answer_science_question(prompt, prediction_context)
+            st.session_state.assistant_history.extend([("user", prompt), ("assistant", answer)])
+
+with st.form("science_explainer_form", clear_on_submit=True):
+    question = st.text_input("Ask a science question", placeholder="Example: How does deep learning use light curves?")
+    submitted = st.form_submit_button("Ask SWAI", width="stretch")
+    if submitted:
+        answer = answer_science_question(question, prediction_context)
+        st.session_state.assistant_history.extend([("user", question), ("assistant", answer)])
+
+for role, message in st.session_state.assistant_history[-8:]:
+    with st.chat_message(role):
+        st.write(message)
